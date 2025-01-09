@@ -1,0 +1,103 @@
+#!/bin/bash
+
+# This script restarts the Wireguard interface if it is frozen and unable to recover.
+#
+# This can happen when some routers/firewalls improperly handle NAT rules and
+# routing tables when a gateway changes (e.g. Internet connection issues) and
+# start dropping Wireguard packets. This situation cannot resolve itself as Wireguard
+# will keep the bogus NAT rule or routing rule alive by sending handshake packets
+# every 5 seconds. The only solution is to stop the packets and wait for the
+# rule to expire on the offending middleware (often after 30s or 60s),
+# or simply restart the interface so it picks a different source UDP port.
+#
+# The script detects this situation by checking if the latest handshake is "stale"
+# and attempting to ping the peer's IP address. If the ping is successful but
+# the Wireguard handshake is stale, the Wireguard packets are most likely dropped
+# on the way.
+#
+# If $FORCE_RESTART is set to 1, the script does not check the Wireguard interface for
+# staleness and simply restarts it if it has not been restarted in more than
+# $RESTART_INTERVAL_MINUTES minutes. This is useful for cases where the Wireguard
+# endpoint cannot be pinged (e.g. due to firewall), to ensure a "frozen" interface
+# will eventually recover.
+
+# Usage: FORCE_RESTART=0|1 wg_watchdog [ INTERFACE ]
+
+set -euo pipefail  # Enable strict error handling
+
+WG_INTERFACE_NAME="${1:-wg0}"
+FORCE_RESTART="${FORCE_RESTART:-0}"
+RESTART_INTERVAL_MINUTES="${RESTART_INTERVAL_MINUTES:-30}"
+HANDSHAKE_THRESHOLD_MINUTES="${HANDSHAKE_THRESHOLD_MINUTES:-15}"
+PING_TIMEOUT_SECONDS="${PING_TIMEOUT_SECONDS:-2}"
+PING_ATTEMPTS="${PING_ATTEMPTS:-1}"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+if [[ $EUID -ne 0 ]]; then
+    log "ERROR: This script must be run as root"
+    exit 1
+fi
+
+if ! ip link show "$WG_INTERFACE_NAME" &>/dev/null; then
+    log "ERROR: Wireguard interface $WG_INTERFACE_NAME does not exist"
+    exit 1
+fi
+
+if [ "$FORCE_RESTART" = "1" ]; then
+    # Check if last restart was more than RESTART_INTERVAL_MINUTES ago
+    LAST_RESTART_FILE="/var/run/wg-last-restart-${WG_INTERFACE_NAME}"
+    current_time=$(date +%s)
+
+    if [ -f "$LAST_RESTART_FILE" ]; then
+        last_restart=$(cat "$LAST_RESTART_FILE")
+        minutes_since_restart=$(( (current_time - last_restart) / 60 ))
+
+        if [ "$minutes_since_restart" -lt "$RESTART_INTERVAL_MINUTES" ]; then
+            log "Last restart was ${minutes_since_restart} minutes ago. Next restart in $((RESTART_INTERVAL_MINUTES - minutes_since_restart)) minutes"
+            exit 0
+        fi
+    fi
+
+    log "Performing scheduled restart of Wireguard interface $WG_INTERFACE_NAME..."
+    if systemctl restart "wg-quick@$WG_INTERFACE_NAME"; then
+        log "Successfully restarted Wireguard interface"
+        echo "$current_time" > "$LAST_RESTART_FILE"
+    else
+        log "ERROR: Failed to restart Wireguard interface"
+        exit 1
+    fi
+else
+    peer_info=$(wg show "$WG_INTERFACE_NAME" dump 2>/dev/null | awk 'FNR > 1')
+    if [[ -z "$peer_info" ]]; then
+        log "ERROR: No peers found for interface $WG_INTERFACE_NAME"
+        exit 1
+    fi
+
+    peer_ip_address=$(echo "$peer_info" | awk '{ print $3 }' | awk -F: '{print $1}')
+    latest_handshake=$(echo "$peer_info" | awk '{ print $5 }')
+
+    stale_handshake_threshold=$(date -d"-${HANDSHAKE_THRESHOLD_MINUTES} min" +%s)
+
+    log "Testing connectivity to peer $peer_ip_address..."
+    if ! ping -c "$PING_ATTEMPTS" -W "$PING_TIMEOUT_SECONDS" "$peer_ip_address" &>/dev/null; then
+        log "WARNING: Cannot reach peer at $peer_ip_address"
+        can_reach_endpoint=1
+    else
+        can_reach_endpoint=0
+    fi
+
+    if [ $can_reach_endpoint -eq 0 ] && [ "$latest_handshake" -lt "$stale_handshake_threshold" ]; then
+        log "Detected stale handshake. Last handshake: $(date -d @"$latest_handshake")"
+        log "Restarting Wireguard interface $WG_INTERFACE_NAME..."
+
+        if systemctl restart "wg-quick@$WG_INTERFACE_NAME"; then
+            log "Successfully restarted Wireguard interface"
+        else
+            log "ERROR: Failed to restart Wireguard interface"
+            exit 1
+        fi
+    fi
+fi
